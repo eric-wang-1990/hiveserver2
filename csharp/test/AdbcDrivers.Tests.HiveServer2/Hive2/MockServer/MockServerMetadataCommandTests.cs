@@ -19,6 +19,7 @@ using System.Threading.Tasks;
 using AdbcDrivers.HiveServer2;
 using AdbcDrivers.HiveServer2.TestServer;
 using AdbcDrivers.Tests.HiveServer2.MockServer;
+using Apache.Arrow;
 using Apache.Arrow.Adbc;
 using Xunit;
 
@@ -82,6 +83,36 @@ namespace AdbcDrivers.Tests.HiveServer2.Hive2.MockServer
             QueryResult result = await statement.ExecuteQueryAsync();
             result.Stream?.Dispose();
             Assert.True(called);
+        }
+
+        [Fact]
+        public async Task GetTables_EmptyTableType_DefaultedToTable()
+        {
+            // The Thrift server returns an empty TABLE_TYPE for some tables (e.g. legacy
+            // hive_metastore tables). EnhanceGetTablesResult must default empty/null → "TABLE"
+            // (JDBC parity) while leaving a real value ("VIEW") untouched.
+            using var scenario = HiveMockServer.Create();
+            scenario.Stub.OnGetTables = _ => MockResult.Builder()
+                .String("TABLE_CAT", "main", "main", "main")
+                .String("TABLE_SCHEM", "default", "default", "default")
+                .String("TABLE_NAME", "trim_repro", "trim_repro_view", "orders")
+                .String("TABLE_TYPE", "", "", "VIEW")
+                .String("REMARKS", "", "", "")
+                .Build();
+
+            using var statement = MetadataStatement(scenario);
+            statement.SqlQuery = "gettables";
+            QueryResult result = await statement.ExecuteQueryAsync();
+
+            using var stream = result.Stream!;
+            using RecordBatch? batch = await stream.ReadNextRecordBatchAsync();
+            Assert.NotNull(batch);
+
+            int idx = stream.Schema.GetFieldIndex("TABLE_TYPE");
+            StringArray types = Assert.IsType<StringArray>(batch!.Column(idx));
+            Assert.Equal("TABLE", types.GetString(0)); // empty → TABLE
+            Assert.Equal("TABLE", types.GetString(1)); // empty → TABLE
+            Assert.Equal("VIEW", types.GetString(2));  // preserved
         }
 
         [Fact]

@@ -563,7 +563,51 @@ namespace AdbcDrivers.HiveServer2.Hive2
                 tableTypesList,
                 cancellationToken);
 
-            return await GetQueryResult(response, cancellationToken);
+            // Materialize so the TABLE_TYPE column can be defaulted inline (see
+            // EnhanceGetTablesResult), mirroring the GetColumns enrichment path below.
+            if (!Connection.TryGetDirectResults(response.DirectResults, out TGetResultSetMetadataResp? metadata, out TRowSet? rowSet))
+            {
+                await Connection.PollForResponseAsync(response.OperationHandle!, Connection.Client, PollTimeMilliseconds, cancellationToken);
+                metadata = await Connection.GetResultSetMetadataAsync(response.OperationHandle!, Connection.Client, cancellationToken);
+                rowSet = await Connection.FetchResultsAsync(response.OperationHandle!, BatchSize, cancellationToken);
+            }
+
+            Schema schema = Connection.SchemaParser.GetArrowSchema(metadata!.Schema, Connection.DataTypeConversion);
+            int columnCount = HiveServer2Reader.GetColumnCount(rowSet);
+            int rowCount = HiveServer2Reader.GetRowCount(rowSet, columnCount);
+            IReadOnlyList<IArrowArray> data = HiveServer2Reader.GetArrowArrayData(rowSet, columnCount, schema, Connection.DataTypeConversion);
+
+            return EnhanceGetTablesResult(schema, data, rowCount, metadata);
+        }
+
+        /// <summary>
+        /// Enhances the GetTables result by substituting "TABLE" for any null/empty TABLE_TYPE,
+        /// matching databricks-jdbc's MetadataResultSetBuilder (empty/null → "TABLE"). The
+        /// HiveServer2 Thrift server returns an empty TABLE_TYPE for some tables (e.g. legacy
+        /// hive_metastore tables in a broad enumeration), but the JDBC getTables contract expects
+        /// a non-null table type, so default it here at the read path. Non-empty values
+        /// (TABLE / VIEW / SYSTEM TABLE / …) pass through unchanged.
+        /// </summary>
+        protected internal QueryResult EnhanceGetTablesResult(Schema schema, IReadOnlyList<IArrowArray> data,
+            int rowCount, TGetResultSetMetadataResp metadata)
+        {
+            IReadOnlyDictionary<string, int> columnMap = Connection.GetColumnIndexMap(metadata.Schema.Columns);
+            if (!columnMap.TryGetValue("TABLE_TYPE", out int tableTypeIndex)
+                || data[tableTypeIndex] is not StringArray tableTypes)
+            {
+                return new QueryResult(rowCount, new HiveInfoArrowStream(schema, data));
+            }
+
+            StringArray.Builder builder = new StringArray.Builder();
+            for (int i = 0; i < tableTypes.Length; i++)
+            {
+                string? value = tableTypes.IsNull(i) ? null : tableTypes.GetString(i);
+                builder.Append(string.IsNullOrEmpty(value) ? "TABLE" : value);
+            }
+
+            List<IArrowArray> enhancedData = new List<IArrowArray>(data);
+            enhancedData[tableTypeIndex] = builder.Build();
+            return new QueryResult(rowCount, new HiveInfoArrowStream(schema, enhancedData));
         }
 
         protected virtual async Task<QueryResult> GetColumnsAsync(CancellationToken cancellationToken = default)
